@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 
 	"geektutu/geerpc/codec"
@@ -24,10 +25,57 @@ var DefaultOption Option = Option{
 	CodecType:   codec.GobType,
 }
 
-type Server struct{}
+type Server struct {
+	// server内含一个可访问的服务映射表：服务名/服务实例
+	serviceMap sync.Map
+}
 
 func NewServer() *Server {
 	return &Server{}
+}
+
+// 将一个具体的用于提供服务的对象实例添加到Server的sync.Map中
+// 后续Server会从中加载对应对象实例并向客户端提供服务。
+func (srv *Server) Register(service interface{}) error {
+	svc, err := newService(service)
+	if err != nil {
+		return err
+	}
+	// 将服务实例store到map中。
+	if _, dup := srv.serviceMap.LoadOrStore(svc.name, svc); dup {
+		// 重复注册并不是个严重的问题，在日志中提示即可
+		log.Printf("rpc server: service %s has already been registered\n", svc.name)
+	}
+	log.Printf("rpc server: service %s register successfully\n", svc.name)
+	return nil
+}
+
+// 根据请求头Header.ServiceMethod字符串，返回装载的对象实例，以及具体方法对象
+func (srv *Server) findServiceMethod(ServiceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(ServiceMethod, ".")
+	if dot < 0 {
+		err = fmt.Errorf("rpc server: %s is ill-formed format. should be <service.method>", ServiceMethod)
+		return
+	}
+	serviceName := ServiceMethod[:dot]
+	methodName := ServiceMethod[dot+1:]
+
+	// 从Server中加载Service，得到*service
+	svci, ok := srv.serviceMap.Load(serviceName)
+	if !ok {
+		err = fmt.Errorf("rpc server: service %s doesn't exist", serviceName)
+		return
+	}
+	svc = svci.(*service)
+	mtype = svc.methods[methodName]
+	if mtype == nil {
+		err = fmt.Errorf("rpc server: method %s doesn't exist", methodName)
+	}
+	return
+}
+
+func Register(service interface{}) error {
+	return DefaultServer.Register(service)
 }
 
 var DefaultServer = NewServer()
@@ -124,25 +172,51 @@ func (srv *Server) ServeCodec(cc codec.Codec) {
 type request struct {
 	h            *codec.Header // header of request
 	argv, replyv reflect.Value // argv and replyv of request
+	svc          *service
+	method       *methodType
 }
 
-// 从连接的输入流中读取请求并解析，将所得放到request对象中。
-func (srv *Server) readRequest(cc codec.Codec) (*request, error) {
+// 从连接的输入流中读取请求，关键是请求的
+// service.method（含有arg，reply的类型信息）
+// arg的具体取值
+// 拿到这三个信息就足够了。然后再根据这些信息，在本地调用服务方法，
+// 此时会将结果写入到reply对象中，最后将这个对象连同请求头编码后写入到流中，响应给客户端。
+// 其实reply的类型及值也可以从前面三个信息中获取，但太麻烦
+// 所以直接在解析method，得到arg的type时，也同时保存reply的type，并返回。
+func (srv *Server) readRequest(cc codec.Codec) (req *request, err error) {
 	var header codec.Header
-	if err := cc.ReadHeader(&header); err != nil {
+	if err = cc.ReadHeader(&header); err != nil {
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			// 发现错误
 			log.Println("rpc server: read header error:", err)
 		}
-		return nil, err
+		return
 	}
 
-	req := &request{h: &header}
+	req = &request{}
+	req.h = &header
+	req.svc, req.method, err = srv.findServiceMethod(header.ServiceMethod)
+	if err != nil {
+		// 没有找到对应的服务.方法，说明请求有误，因为请求头已经读取成功，
+		// 我们尝试读取body参数后，返回这个错误，以便继续服务下一个请求
+		cc.ReadBody(nil)
+		return
+	}
+	req.argv = req.method.newArgValue()
+	req.replyv = req.method.newReplyValue()
 
-	// 默认请求对象是字符串，我们用一个字符串来接受请求
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err := cc.ReadBody(req.argv.Interface()); err != nil {
+	// readbody的参数必须是一个指针对象，且这个所指的对象必须已经分配了内存。
+	// 但实际方法的定义上，argv即可能是指针，也可能不是指针。
+	// newArgValue()根据情况创建一个具体对象，或者一个已经分配了内存的指针对象
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		// 常规情况下我们传输的是一个普通的对象作为参数，所以我们要将其转换为一个指针对象
+		argvi = req.argv.Addr().Interface()
+	}
+
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read argv err:", err)
+		return
 	}
 	return req, nil
 }
@@ -159,7 +233,19 @@ func (srv *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{
 // 暂时只响应固定的信息：geerpc resp num，
 func (srv *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println("rpc server, the getting request is(header/body) ", *(req.h), "/", req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
-	srv.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	log.Printf(
+		"rpc server: handle request: (*%s) %s(%s, *%s); request arg:%v\n",
+		req.svc.name,
+		req.method.method.Name,
+		req.argv.Type().Name(),
+		req.replyv.Elem().Type().Name(),
+		reflect.Indirect(req.argv).Interface(),
+	)
+	err := req.svc.call(req.method, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		srv.sendResponse(cc, req.h, invalidRequestResponse, sending)
+		return
+	}
+	srv.sendResponse(cc, req.h, req.replyv.Elem().Interface(), sending)
 }
