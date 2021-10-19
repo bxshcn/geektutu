@@ -1,12 +1,14 @@
 package geerpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"geektutu/geerpc/codec"
 )
@@ -145,9 +147,21 @@ func (c *Client) Go(ServiceMethod string, args, reply interface{}, done chan *Ca
 }
 
 // 客户端与服务端通过call中的Done（带缓冲的通道）来实施同步
-func (c *Client) Call(ServiceMethod string, args, reply interface{}) error {
-	call := <-c.Go(ServiceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+//call := <-c.Go(ServiceMethod, args, reply, make(chan *Call, 1)).Done
+// 实际上是如下一般写法的简写形式：
+// done := make(chan *Call, 1)
+// c.Go(ServiceMethod, args, reply, done)  // 异步调用，并不是说发起一个新的goroutine，而是发出请求后就不管了。
+// call := <-done   // 强制同步等待
+func (c *Client) Call(ctx context.Context, ServiceMethod string, args, reply interface{}) error {
+	//call := <-c.Go(ServiceMethod, args, reply, make(chan *Call, 1)).Done
+	call := c.Go(ServiceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		c.removeCall(call.Seq)
+		return fmt.Errorf("call %s timeout", call.ServiceMethod)
+	case c := <-call.Done:
+		return c.Error
+	}
 }
 
 // receive接收响应信息，我们可以根据接收到的信息头中的seq来明确具体是哪个call。
@@ -198,37 +212,64 @@ func (c *Client) receive() {
 	c.terminateCalls(err)
 }
 
-func parseOption(cc ...codec.Type) (*Option, error) {
-	if len(cc) > 1 {
-		return nil, errors.New("should specify at most 1 codec type")
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+func parseOption(opts ...*Option) (*Option, error) {
+	if len(opts) > 1 {
+		return nil, errors.New("should specify at most 1 option")
 	}
-	if len(cc) == 0 {
+	if len(opts) == 0 || opts[0] == nil {
+		log.Println("parseoption, default")
 		return &DefaultOption, nil
 	}
 
-	return &Option{
-		MagicNumber: magicNumber,
-		CodecType:   cc[0],
-	}, nil
+	opt := opts[0]
+	if opt.CodecType == "" {
+		opt.CodecType = DefaultOption.CodecType
+		opt.MagicNumber = DefaultOption.MagicNumber
+	}
+	return opt, nil
 }
 
 // 提供用户接口，
-func Dial(network, address string, cc ...codec.Type) (*Client, error) {
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 	// 首先分析opt的有效性，设置合理的Option
-	opt, err := parseOption(cc...)
+	opt, err := parseOption(opts...)
 	if err != nil {
 		return nil, err
 	}
 	// 确认参数正确的情况下，尝试和服务端建立网络连接
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-	/*defer func() {
-		conn.Close()
-	}()*/
+	defer func() {
+		if err != nil {
+			conn.Close()
+		}
+	}()
 	// 然后创建Client，最后返回
-	return NewClient(conn, opt)
+	// 创建client可能超时，因此我们使用子例程来创建client，并利用通道，以及select语句来检测超时情况
+	ch := make(chan clientResult)
+	go func() {
+		client, err := NewClient(conn, opt)
+		// for test timeout
+		//time.Sleep(2 * time.Second)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
 }
 
 func newClientCodec(cc codec.Codec) *Client {
@@ -242,6 +283,7 @@ func newClientCodec(cc codec.Codec) *Client {
 
 // 创建一个新client的实质，是创建一个Client对象，发送协商编解码信息，然后启动一个receive()的goroutine
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
+	log.Println("opt.codetype is ", opt.CodecType)
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)

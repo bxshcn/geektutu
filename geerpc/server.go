@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"geektutu/geerpc/codec"
 )
@@ -16,13 +17,16 @@ import (
 const magicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption Option = Option{
-	MagicNumber: magicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    magicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: 10 * time.Second,
 }
 
 type Server struct {
@@ -126,13 +130,14 @@ func (srv *Server) ServeConn(conn io.ReadWriteCloser) {
 	log.Println("rpc server: codec is ", opt.CodecType)
 	log.Println("rpc server: preparing for getting request...")
 	// 最后使用编解码器解析请求并给出响应
-	srv.ServeCodec(codecFunc(conn))
+	srv.ServeCodec(codecFunc(conn), opt.HandleTimeout)
 }
 
 // 无效请求给回的响应，在请求有问题时返回，注意提前设置Header中的Error参数
 var invalidRequestResponse = struct{}{}
 
-func (srv *Server) ServeCodec(cc codec.Codec) {
+func (srv *Server) ServeCodec(cc codec.Codec, timeout time.Duration) {
+	log.Println("rpc server: servercodec: timeout is ", timeout)
 	// codec的具体实现有一个conn字段用于表示连接，我们只需要根据接口来读取Header，body，并写响应信息
 	// Header包含了ServiceMethod，body中包含了请求的参数，因此我们会根据这两类信息，在本地调用
 	// 执行命令，然后将结果编码后写入返回。
@@ -152,7 +157,7 @@ func (srv *Server) ServeCodec(cc codec.Codec) {
 		log.Println("rpc server: start handling... ")
 
 		wg.Add(1)
-		go srv.handleRequest(cc, req, sending, wg)
+		go srv.handleRequest(cc, req, sending, wg, timeout)
 	}
 	wg.Wait()
 	cc.Close()
@@ -230,8 +235,9 @@ func (srv *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{
 	log.Println("rpc server: write response(header/body) ", h, "/", body)
 }
 
-// 暂时只响应固定的信息：geerpc resp num，
-func (srv *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+// 使用编解码器cc，读取请求并写回响应req。多个go routine之间要共享同一rpc通道，因此需要使用sending来互斥
+// 如果主go routine因特别原因跳出for循环，必须等待所有子go routine结束后，才能结束，因此需要使用wg。
+func (srv *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
 	log.Printf(
 		"rpc server: handle request: (*%s) %s(%s, *%s); request arg:%v\n",
@@ -241,11 +247,36 @@ func (srv *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mut
 		req.replyv.Elem().Type().Name(),
 		reflect.Indirect(req.argv).Interface(),
 	)
-	err := req.svc.call(req.method, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		srv.sendResponse(cc, req.h, invalidRequestResponse, sending)
+	// 使用通道来表示完成的状态
+	called := make(chan struct{})
+	// 启用goroutine调用后端服务
+	go func() {
+		err := req.svc.call(req.method, req.argv, req.replyv)
+		if err != nil {
+			req.h.Error = err.Error()
+			log.Printf("rpc server: call back service error: %s\n", req.h.Error)
+			called <- struct{}{}
+			return
+		}
+		called <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		if req.h.Error != "" {
+			srv.sendResponse(cc, req.h, invalidRequestResponse, sending)
+		}
 		return
 	}
-	srv.sendResponse(cc, req.h, req.replyv.Elem().Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("call back service timeout in %s seconds", timeout)
+		log.Printf("rpc server: call back service error: %s\n", req.h.Error)
+		srv.sendResponse(cc, req.h, invalidRequestResponse, sending)
+	case <-called:
+		if req.h.Error != "" {
+			srv.sendResponse(cc, req.h, invalidRequestResponse, sending)
+			return
+		}
+		srv.sendResponse(cc, req.h, req.replyv.Elem().Interface(), sending)
+	}
 }
