@@ -1,12 +1,16 @@
 package geerpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -236,40 +240,7 @@ func parseOption(opts ...*Option) (*Option, error) {
 
 // 提供用户接口，
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-	// 首先分析opt的有效性，设置合理的Option
-	opt, err := parseOption(opts...)
-	if err != nil {
-		return nil, err
-	}
-	// 确认参数正确的情况下，尝试和服务端建立网络连接
-	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
-	// 然后创建Client，最后返回
-	// 创建client可能超时，因此我们使用子例程来创建client，并利用通道，以及select语句来检测超时情况
-	ch := make(chan clientResult)
-	go func() {
-		client, err := NewClient(conn, opt)
-		// for test timeout
-		//time.Sleep(2 * time.Second)
-		ch <- clientResult{client: client, err: err}
-	}()
-	if opt.ConnectTimeout == 0 {
-		result := <-ch
-		return result.client, result.err
-	}
-	select {
-	case <-time.After(opt.ConnectTimeout):
-		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
-	case result := <-ch:
-		return result.client, result.err
-	}
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 func newClientCodec(cc codec.Codec) *Client {
@@ -299,4 +270,91 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	}
 	go client.receive()
 	return client, nil
+}
+
+//
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	if conn == nil {
+		return nil, errors.New("connection is nil")
+	}
+	// 发送http连接请求 CONNECT, 注意必须用\n\n，而不用能\n\r，否则发送不出去，为什么呢？
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath)
+	_, err := io.WriteString(conn, connectReq)
+	if err != nil {
+		log.Println("build http tunnel: send connect failed: ", err.Error())
+	}
+	log.Printf("build http tunnel: send connect request %s successfully\n", connectReq)
+	// 确认响应正常
+	// 就可以基于http建立tunnel了（即基于底层的tcp通道传输rpc请求）
+	// 基于http建立连接后，不关闭底层的tcp连接，而是使用http.Hijacker.Hijack()拿到底层的tcp连接
+	// 然后基于rpc协议进行数据传输。
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == codeReason {
+		log.Println("build http tunnel successfully")
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	log.Println("build http tunnel failed")
+	return nil, err
+}
+
+type ClientFunc func(net.Conn, *Option) (*Client, error)
+
+func DialHTTP(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+func dialTimeout(f ClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	// 首先分析opt的有效性，设置合理的Option
+	opt, err := parseOption(opts...)
+	if err != nil {
+		return nil, err
+	}
+	// 确认参数正确的情况下，尝试和服务端建立tcp网络连接
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			conn.Close()
+		}
+	}()
+	// 然后创建Client，最后返回
+	// 创建client可能超时，因此我们使用子例程来创建client，并利用通道，以及select语句来检测超时情况
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		// for test timeout
+		//time.Sleep(2 * time.Second)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		return Dial(protocol, addr, opts...)
+	}
+
 }

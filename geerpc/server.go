@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -279,4 +280,53 @@ func (srv *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mut
 		}
 		srv.sendResponse(cc, req.h, req.replyv.Elem().Interface(), sending)
 	}
+}
+
+const (
+	// Status-Code Reason-Phrase
+	codeReason          = "202 Connected to Gee RPC accepted"
+	defaultRPCPath      = "/_geerpc"
+	defaultRPCDebugPath = "/debug/geerpc"
+)
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	//log.Println("http server: start serving")
+	// 读取响应，如果是到指定路径的CONNECT连接，则劫持后，将请求的tcp连接交给后端创建服务
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte("http request must use CONNECT first"))
+		return
+	}
+	// 劫持底层的tcp连接，用于rpc协议数据包处理
+	// 相当于将rpc包封装在http隧道中。
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(
+			fmt.Sprintf("failed to hijack remote client %s connection: %s", req.RemoteAddr, err.Error()),
+		))
+		log.Printf("failed to hijack remote client %s connection: %s", req.RemoteAddr, err.Error())
+		return
+	}
+
+	// 拿到连接后，将其交给后端的rpc进行处理。注意此时，服务端只发了一个响应的status_line
+	// 而没有发送其他任何头和内容。
+	// 其预设前提是，客户端会基于这个连接发送rpc请求
+	// 即基于rpc协议发送请求（发送json编解码协商包，然后是header+args_body|header+args_body
+	log.Println("http server: send back http response")
+	io.WriteString(conn, "HTTP/1.0 "+codeReason+"\n\n")
+	s.ServeConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+	log.Println("http: rpc server path:", defaultRPCPath)
+	http.Handle(defaultRPCDebugPath, debugHTTP{s})
+	log.Println("http: rpc server debug path:", defaultRPCDebugPath)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }
