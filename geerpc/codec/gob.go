@@ -11,7 +11,7 @@ import (
 // 接口只是行为，实现接口的结构体必须操作一定的数据对象，这样结构体才有现实意义
 // 编解码首先要针对一个流，我们用
 type GobCodec struct {
-	conn   io.ReadWriteCloser
+	Conn   io.ReadWriteCloser
 	buf    *bufio.Writer // 根据conn创建一个缓冲，避免写阻塞，提高效率
 	dec    *gob.Decoder
 	enc    *gob.Encoder
@@ -21,7 +21,7 @@ type GobCodec struct {
 func NewGobCodec(rwc io.ReadWriteCloser) Codec {
 	buf := bufio.NewWriter(rwc)
 	return &GobCodec{
-		conn: rwc,
+		Conn: rwc,
 		buf:  buf,
 		dec:  gob.NewDecoder(rwc),
 		enc:  gob.NewEncoder(buf),
@@ -65,5 +65,5 @@ func (c *GobCodec) Close() error {
 		return nil
 	}
 	c.closed = true
-	return c.conn.Close()
+	return c.Conn.Close()
 }

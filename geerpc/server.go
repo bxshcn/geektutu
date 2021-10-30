@@ -138,7 +138,8 @@ func (srv *Server) ServeConn(conn io.ReadWriteCloser) {
 var invalidRequestResponse = struct{}{}
 
 func (srv *Server) ServeCodec(cc codec.Codec, timeout time.Duration) {
-	log.Println("rpc server: servercodec: timeout is ", timeout)
+	c := cc.(*codec.GobCodec).Conn.(net.Conn)
+	log.Printf("rpc server %s: servercodec: timeout is %s\n", c.LocalAddr().String(), timeout)
 	// codec的具体实现有一个conn字段用于表示连接，我们只需要根据接口来读取Header，body，并写响应信息
 	// Header包含了ServiceMethod，body中包含了请求的参数，因此我们会根据这两类信息，在本地调用
 	// 执行命令，然后将结果编码后写入返回。
@@ -154,7 +155,7 @@ func (srv *Server) ServeCodec(cc codec.Codec, timeout time.Duration) {
 			}
 			break
 		}
-		log.Println("rpc server: get a request: ", req.h.ServiceMethod, req.h.Seq)
+		log.Printf("rpc server %s: get a request(%s(%v)) from %s: ", c.LocalAddr().String(), req.h.ServiceMethod, req.argv, c.RemoteAddr().String())
 		log.Println("rpc server: start handling... ")
 
 		wg.Add(1)
@@ -266,6 +267,7 @@ func (srv *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mut
 		if req.h.Error != "" {
 			srv.sendResponse(cc, req.h, invalidRequestResponse, sending)
 		}
+		srv.sendResponse(cc, req.h, req.replyv.Elem().Interface(), sending)
 		return
 	}
 	select {

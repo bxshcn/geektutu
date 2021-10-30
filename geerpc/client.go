@@ -41,6 +41,8 @@ func (c *Call) done() {
 type Client struct {
 	cc codec.Codec // 使用接口来表示一个具体的编解码实例，在初始化客户端时必须提供一个具体的编解码实例
 
+	remoteAddr string // 为方便跟踪，将远端的地址也存在客户端本地
+
 	// client已经有了cc这个编解码信息，因此不再需要opt，
 	// 当然为了方便我们可以将opt放到Client结构中，但目前看不出有什么作用
 	// opt *Option
@@ -64,6 +66,15 @@ func (c *Client) Close() error {
 	}
 	c.closing = true
 	return c.cc.Close()
+}
+
+func (c *Client) IsAlive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.shutdown {
+		return false
+	}
+	return true
 }
 
 // 我们将新生成的call附加到pending中，即完成注册，后续得到一个响应，
@@ -121,7 +132,7 @@ func (c *Client) send(call *Call) {
 	// 为了实施并发控制，必须使用client中的header参数，否则多个并发的请求会扰乱服务端接收到的信息。
 	// var header codec.Header
 	c.header.ServiceMethod, c.header.Seq = call.ServiceMethod, seq
-	log.Println("rpc client: write request(header/body): ", *(c.header), "/", call.Args)
+	log.Printf("rpc client: write request(header/body)%v/%v to %s", *(c.header), call.Args, c.remoteAddr)
 	err = c.cc.Write(c.header, call.Args)
 	if err != nil {
 		call := c.removeCall(call.Seq)
@@ -182,13 +193,15 @@ func (c *Client) Call(ctx context.Context, ServiceMethod string, args, reply int
 // 2. 有错误，call.Error非空
 // 3. 正确处理，此时需要读取服务端发送的header和body：c.cc.ReadHeader(*Header),c.cc.ReadBody(interface{})
 func (c *Client) receive() {
+	log.Println("rpc client: start receiving loop: ")
 	var err error
 	for err == nil {
 		var h codec.Header
 		if err = c.cc.ReadHeader(&h); err != nil { // 先读响应头
+			log.Printf("rpc client: receive %s's response header failed\n", c.remoteAddr)
 			break
 		}
-		log.Println("rpc client: receive response header: ", h)
+		log.Printf("rpc client: receive %s's response header: %v\n", c.remoteAddr, h)
 		// 读取响应头成功，表明这个call服务端已经处理，因此需要从本地删除，同时进行后续处理
 		call := c.removeCall(h.Seq)
 
@@ -206,7 +219,7 @@ func (c *Client) receive() {
 			call.done()
 		default:
 			err = c.cc.ReadBody(call.Reply)
-			log.Println("rpc client: receive response body: ", call.Reply)
+			log.Printf("rpc client: receive response body %d \n", *(call.Reply.(*int)))
 			if err != nil {
 				call.Error = errors.New("reading body " + err.Error())
 			}
@@ -243,17 +256,18 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 	return dialTimeout(NewClient, network, address, opts...)
 }
 
-func newClientCodec(cc codec.Codec) *Client {
+func newClientCodec(cc codec.Codec, address string) *Client {
 	return &Client{
-		seq:     1,
-		cc:      cc,
-		header:  &codec.Header{},
-		pending: make(map[uint64]*Call),
+		remoteAddr: address,
+		seq:        1,
+		cc:         cc,
+		header:     &codec.Header{},
+		pending:    make(map[uint64]*Call),
 	}
 }
 
 // 创建一个新client的实质，是创建一个Client对象，发送协商编解码信息，然后启动一个receive()的goroutine
-func NewClient(conn net.Conn, opt *Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *Option, address string) (*Client, error) {
 	log.Println("opt.codetype is ", opt.CodecType)
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
@@ -263,7 +277,7 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	}
 	// client只负责发送请求，而不发送协商内容。
 	// 只有依赖client实际发送了请求，才会有receive的需求。
-	client := newClientCodec(f(conn))
+	client := newClientCodec(f(conn), address)
 	// 发送协商编解码信息
 	if err := json.NewEncoder(conn).Encode(opt); err != nil {
 		return nil, err
@@ -273,7 +287,7 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 }
 
 //
-func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+func NewHTTPClient(conn net.Conn, opt *Option, address string) (*Client, error) {
 	if conn == nil {
 		return nil, errors.New("connection is nil")
 	}
@@ -291,7 +305,7 @@ func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
 	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
 	if err == nil && resp.Status == codeReason {
 		log.Println("build http tunnel successfully")
-		return NewClient(conn, opt)
+		return NewClient(conn, opt, address)
 	}
 	if err == nil {
 		err = errors.New("unexpected HTTP response: " + resp.Status)
@@ -300,7 +314,7 @@ func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
 	return nil, err
 }
 
-type ClientFunc func(net.Conn, *Option) (*Client, error)
+type ClientFunc func(net.Conn, *Option, string) (*Client, error)
 
 func DialHTTP(network, address string, opts ...*Option) (client *Client, err error) {
 	return dialTimeout(NewHTTPClient, network, address, opts...)
@@ -326,7 +340,7 @@ func dialTimeout(f ClientFunc, network, address string, opts ...*Option) (client
 	// 创建client可能超时，因此我们使用子例程来创建client，并利用通道，以及select语句来检测超时情况
 	ch := make(chan clientResult)
 	go func() {
-		client, err := f(conn, opt)
+		client, err := f(conn, opt, address)
 		// for test timeout
 		//time.Sleep(2 * time.Second)
 		ch <- clientResult{client: client, err: err}
@@ -343,7 +357,9 @@ func dialTimeout(f ClientFunc, network, address string, opts ...*Option) (client
 	}
 }
 
+// rpcAddr的格式为http@
 func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	log.Println("XDial: ", rpcAddr)
 
 	parts := strings.Split(rpcAddr, "@")
 	if len(parts) != 2 {
