@@ -106,7 +106,7 @@ func suitableMethods(serviceType reflect.Type) map[string]*methodType {
 			continue
 		}
 		// 出参必须是error类型
-		if mType.Out(i) != reflect.TypeOf((*error)(nil)).Elem() {
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
 			log.Printf("rpc server: register service %s: method %s is not suilted for rpc request, ommited\n", serviceType.Name(), method.PkgPath+method.Name)
 			continue
 		}
