@@ -26,8 +26,18 @@ type Session struct {
 
 	// 支持insert等DML具体操作
 	clause clause.Clause
+
+	// 支持事务
+	tx *sql.Tx
 }
 
 func New(db *sql.DB, dialect dialect.Dialect) *Session {
 	return &Session{db: db, dialect: dialect}
+}
+
+// CommonDB is a minimal function set of db
+type CommonDB interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+	Exec(query string, args ...interface{}) (sql.Result, error)
 }

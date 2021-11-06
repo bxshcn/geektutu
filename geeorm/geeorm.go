@@ -50,3 +50,26 @@ func (engine *Engine) Close() {
 func (engine *Engine) NewSession() *session.Session {
 	return session.New(engine.db, engine.dialect)
 }
+
+// 事务函数，将事务相关操作置于函数中。
+// 基于具体的session（表），将操作的结果置于interface{}中，并伴有error输出
+type TxFunc func(*session.Session) (interface{}, error)
+
+func (engine *Engine) Transaction(tf TxFunc) (result interface{}, err error) {
+	s := engine.NewSession()
+	if err := s.Begin(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = s.Rollback()
+			panic(p) // re-throw panic after Rollback
+		} else if err != nil {
+			_ = s.Rollback() // err is non-nil; don't change it
+		} else {
+			err = s.Commit() // err is nil; if Commit returns error update err
+		}
+	}()
+
+	return tf(s)
+}
